@@ -1,48 +1,68 @@
 #include <pcap.h>
 #include <zstd.h>
 #include <fstream>
-#include <vector>
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
+#include <cstdio>
+#include <vector>
+#include <filesystem>
 
-std::vector<uint8_t> decompressZstdFile(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) throw std::runtime_error("Failed to open input file");
+namespace fs = std::filesystem;
 
-    file.seekg(0, std::ios::end);
-    size_t compressed_size = file.tellg();
-    file.seekg(0);
+std::string decompress_zst_to_temp(const std::string& zst_file) {
+    std::ifstream in(zst_file, std::ios::binary);
+    if (!in) throw std::runtime_error("Cannot open input .zst file");
 
-    std::vector<uint8_t> compressed_data(compressed_size);
-    file.read(reinterpret_cast<char*>(compressed_data.data()), compressed_size);
+    in.seekg(0, std::ios::end);
+    size_t compressed_size = in.tellg();
+    in.seekg(0);
 
-    unsigned long long const decompressed_bound = ZSTD_getFrameContentSize(compressed_data.data(), compressed_size);
-    if (decompressed_bound == ZSTD_CONTENTSIZE_ERROR || decompressed_bound == ZSTD_CONTENTSIZE_UNKNOWN)
-        throw std::runtime_error("Invalid or unknown compressed size");
+    std::vector<char> compressed_data(compressed_size);
+    in.read(compressed_data.data(), compressed_size);
 
-    std::vector<uint8_t> decompressed_data(decompressed_bound);
-    size_t result = ZSTD_decompress(decompressed_data.data(), decompressed_bound, compressed_data.data(), compressed_size);
-
-    if (ZSTD_isError(result)) {
-        throw std::runtime_error("Decompression failed: " + std::string(ZSTD_getErrorName(result)));
+    unsigned long long decompressed_size = ZSTD_getFrameContentSize(compressed_data.data(), compressed_size);
+    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR || decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        throw std::runtime_error("Unable to determine decompressed size");
     }
 
-    return decompressed_data;
+    std::vector<char> decompressed_data(decompressed_size);
+    size_t result = ZSTD_decompress(decompressed_data.data(), decompressed_size,
+                                    compressed_data.data(), compressed_size);
+    if (ZSTD_isError(result)) {
+        throw std::runtime_error("Decompression failed");
+    }
+
+    std::string temp_file = fs::temp_directory_path() / fs::path("decompressed_input.pcap");
+    std::ofstream out(temp_file, std::ios::binary);
+    out.write(decompressed_data.data(), result);
+    return temp_file;
 }
 
-void compressToZstdFile(const std::string& filename, const std::vector<uint8_t>& data, int compressionLevel = 3) {
-    size_t bound = ZSTD_compressBound(data.size());
-    std::vector<uint8_t> compressed(bound);
+std::string compress_to_zst(const std::string& pcap_file, const std::string& zst_output_file, int level = 3) {
+    std::ifstream in(pcap_file, std::ios::binary);
+    if (!in) throw std::runtime_error("Cannot open pcap file to compress");
 
-    size_t compressed_size = ZSTD_compress(compressed.data(), bound, data.data(), data.size(), compressionLevel);
+    in.seekg(0, std::ios::end);
+    size_t input_size = in.tellg();
+    in.seekg(0);
+
+    std::vector<char> input_data(input_size);
+    in.read(input_data.data(), input_size);
+
+    size_t bound = ZSTD_compressBound(input_size);
+    std::vector<char> compressed(bound);
+
+    size_t compressed_size = ZSTD_compress(compressed.data(), bound,
+                                           input_data.data(), input_size, level);
     if (ZSTD_isError(compressed_size)) {
-        throw std::runtime_error("Compression failed: " + std::string(ZSTD_getErrorName(compressed_size)));
+        throw std::runtime_error("Compression failed");
     }
 
-    std::ofstream outfile(filename, std::ios::binary);
-    if (!outfile) throw std::runtime_error("Failed to open output file");
-    outfile.write(reinterpret_cast<const char*>(compressed.data()), compressed_size);
+    std::ofstream out(zst_output_file, std::ios::binary);
+    out.write(compressed.data(), compressed_size);
+
+    return zst_output_file;
 }
 
 int main(int argc, char* argv[]) {
@@ -55,31 +75,24 @@ int main(int argc, char* argv[]) {
     const std::string output_zst = argv[2];
 
     try {
-        auto raw_pcap = decompressZstdFile(input_zst);
+        std::string temp_input = decompress_zst_to_temp(input_zst);
+        std::string temp_output = fs::temp_directory_path() / fs::path("filtered_output.pcap");
 
         char errbuf[PCAP_ERRBUF_SIZE];
-        pcap_t* input_handle = pcap_open_offline_with_tstamp_precision(
-            reinterpret_cast<const char*>(raw_pcap.data()), PCAP_TSTAMP_PRECISION_MICRO, errbuf
-        );
-
+        pcap_t* input_handle = pcap_open_offline(temp_input.c_str(), errbuf);
         if (!input_handle) {
-            std::cerr << "Error opening decompressed pcap buffer: " << errbuf << '\n';
+            std::cerr << "Failed to open decompressed input pcap: " << errbuf << '\n';
             return 1;
         }
 
-        // Setup output dumper (writing to a memory buffer)
-        int linktype = pcap_datalink(input_handle);
-        pcap_t* dead_handle = pcap_open_dead(linktype, 65535);
-        std::vector<uint8_t> out_buf;
-        FILE* memstream = open_memstream(reinterpret_cast<char**>(&out_buf), nullptr);
-        pcap_dumper_t* dumper = pcap_dump_fopen(dead_handle, memstream);
+        pcap_t* dead_handle = pcap_open_dead(pcap_datalink(input_handle), 65535);
+        pcap_dumper_t* dumper = pcap_dump_open(dead_handle, temp_output.c_str());
         if (!dumper) {
-            std::cerr << "Failed to create output dumper\n";
+            std::cerr << "Failed to create dumper: " << pcap_geterr(dead_handle) << '\n';
             return 1;
         }
 
         srand(static_cast<unsigned>(time(nullptr)));
-
         const int max_skip = 5;
         int packets_to_skip = 0;
 
@@ -89,30 +102,32 @@ int main(int argc, char* argv[]) {
 
         while ((status = pcap_next_ex(input_handle, &header, &data)) >= 0) {
             if (packets_to_skip > 0) {
-                packets_to_skip--;
+                --packets_to_skip;
                 continue;
             }
 
-            bool skip_now = rand() % 5 == 0;
-            if (skip_now) {
+            bool start_skipping = (rand() % 5 == 0);
+            if (start_skipping) {
                 packets_to_skip = rand() % (max_skip + 1);
             }
 
             pcap_dump(reinterpret_cast<u_char*>(dumper), header, data);
         }
 
-        fflush(memstream);
-        fclose(memstream);
         pcap_dump_close(dumper);
         pcap_close(input_handle);
         pcap_close(dead_handle);
 
-        compressToZstdFile(output_zst, out_buf);
+        compress_to_zst(temp_output, output_zst);
 
-        std::cout << "Written output to: " << output_zst << '\n';
+        std::cout << "Output written to: " << output_zst << "\n";
+
+        // Cleanup
+        std::remove(temp_input.c_str());
+        std::remove(temp_output.c_str());
 
     } catch (const std::exception& e) {
-        std::cerr << "Exception: " << e.what() << '\n';
+        std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
 
